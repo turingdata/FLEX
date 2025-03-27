@@ -3,7 +3,7 @@ import pandas as pd
 import json
 
 # Load JSON data from file
-with open('data.json', 'r') as file:
+with open('data/financial_data.json', 'r') as file:
     json_data = json.load(file)
 
 # Function to parse JSON data into a list of dictionaries

@@ -24,7 +24,7 @@ For Windows:
 
 ## Parse Json and Review as dataframes 
 
-    `python ./utilities/parse.json.py`
+    `python ./Scripts/parse.json.py`
 
 
 ## Analyze the data

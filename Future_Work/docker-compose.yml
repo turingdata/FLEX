@@ -1,0 +1,245 @@
+# THIS IS WHAT AN INCOMPLETE DRAFT. I DIDN'T HAVE ENOUGH TIME TO COMPLETE THIS BUT THERE IS NOUGH
+# TO UNDERSTAND MY VISION. HOPEFULLY I CAN DEMONSTRATE IT DURING IN PERSON INTERVIEW.
+# THE ULTIMATE GOAL IS TO DEMONSTRATE THE POWER OF CERTAIN TOOLS, ESPACIALLY DBT, IN THIS ARCHITECTURE.
+# DESIGN OF THE ARCHITECTURE AND TOOL SELECTION IS CRITICAL FOR ANALYTICS ENGINEERS.
+# UNDERSTANDING THE PIPELINE IS VERY USEFUL WHEN BUILDING VALIDATION STEPS, DATA QUALITY STEPS,
+# BUILDING A DATA DICTIONARY, AND DATA GOVERNANCE.
+
+########################################################################
+
+volumes:
+  datapipeline_FLEX:
+
+########################################################################3
+
+networks:
+  flex_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24 #THIS IS NECESSARY TO AVOID CONFLICTS WITH  EXISTING DOCKER NETWORKS. UPDATE IF NEEDED.
+          gateway: 172.20.0.1
+
+########################################################################
+
+services:
+
+  postgres_for_webapp:  #This is the database server that represents the webapp application database . 
+    container_name: database_postgres_for_webapp
+    hostname: postgres_for_webapp
+    build:
+      context: .
+      dockerfile: dockerfile.postgres_webapp
+    environment:
+      - POSTGRES_USER=admin
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=postgres 
+    command: ['postgres', '-c', 'wal_level=logical']
+    healthcheck:
+      test: ["CMD", "pg_isready", "-q", "-d", "postgres", "-U", "admin"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "5433:5432"
+    restart: always
+    volumes:
+      - ./data_db_webapp_postgres:/var/lib/postgresql/data
+    networks:
+      flex_network:
+        ipv4_address: 172.20.0.2
+
+
+  webapp: #This represents the web application that generates data and stores its data in its application database, 'postgres_for_webapp',  which could be any database.
+    container_name: app_webapp
+    build:
+      context: ./app_webapp
+      dockerfile: Dockerfile
+    environment:
+      - POSTGRES_USER=admin
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=postgres   
+      - POSTGRES_PORT=5432
+      - POSTGRES_HOST=postgres_for_webapp
+    ports:
+      - "5001:5000"
+    depends_on:
+      - postgres_for_webapp
+    restart: always
+    volumes:
+      - ./app_webapp:/app
+    networks:
+      flex_network:
+        ipv4_address: 172.20.0.3
+
+  app_data_generator: #For testing purposes only I would use this to simulate data generation through the webapp
+    container_name: app_data_generator
+    build:
+      context: ./app_data_generator
+      dockerfile: Dockerfile.app_data_generator
+    environment:
+      - DATABASE_ENGINE=postgresql
+      - DATABASE_USER=admin
+      - DATABASE_ROOT_PASSWORD=password
+      - DATABASE_NAME=postgres   
+      - DATABASE_HOST=postgres_for_webapp
+      - DATABASE_PORT=5432
+      - BOOTSTRAP_SERVERS=redpanda_server:9092
+    depends_on:
+      - postgres_for_webapp
+      - redpanda_server
+    restart: unless-stopped
+    volumes:
+      - ./app_data_generator:/app
+    # command: ["tail", "-f", "/dev/null"] #for debugging
+    command: ["python", "post_data_to_postgres_and_kafka.py"]
+    networks:
+      flex_network:
+        ipv4_address: 172.20.0.4
+
+
+  landing_zone_s3: #This represents an S3 bucket where backup is stored. Minio is an opensource S3 provider 
+    container_name: storage_landing_zone_s3
+    image: minio/minio:latest
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    depends_on:
+      - postgres_for_webapp
+      - postgres_for_datawarehouse
+    environment:
+      MINIO_ACCESS_KEY: minio_user
+      MINIO_SECRET_KEY: minio_password
+    volumes:
+      - ./data_s3_raw:/data
+      - ./.config:/root/.minio
+    command: server --console-address ":9001" /data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 3s
+    networks:
+      flex_network:
+        ipv4_address: 172.20.0.5
+
+
+  app_postgres_to_s3: #This represents a lambda server that loads the data to s3 from an application database in this case but it could do any type of transformation
+    container_name: app_postgres_to_S3
+    build:
+      context: ./app_postgres_to_S3
+      dockerfile: dockerfile.postgres_to_s3
+    environment:
+      - POSTGRES_USER=admin
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=postgres   
+      - POSTGRES_HOST=postgres_for_webapp
+      - POSTGRES_PORT=5432
+      - BUCKET_NAME=webapp-bucket
+      - AWS_ACCESS_KEY_ID=GNotw4aO1P6w5rtQmSHR
+      - AWS_SECRET_ACCESS_KEY=BprZP4bmZTBVpxK6ApkLSS3G1v7qYZadYW1bKwyL
+      - AWS_END_POINT=http://172.20.0.5:9000 
+      - AWS_REGION=us-east-6
+    depends_on:
+      postgres_for_webapp:
+        condition: service_healthy
+      landing_zone_s3:
+        condition: service_started
+    stdin_open: true
+    restart: unless-stopped
+    volumes:
+      - ./app_postgres_to_S3:/app
+    networks:
+      flex_network:
+        ipv4_address: 172.20.0.6
+
+            
+  postgres_for_datawarehouse:  #This is the database server that represents the datawarehouse of the enterprise. This would be a database for rapid analytics such as Redshift
+    container_name: database_postgres_for_datawarehouse
+    build:
+      context: .
+      dockerfile: dockerfile.postgres_datawarehouse
+    environment:
+      - POSTGRES_USER=admin
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=postgres 
+    command: ['postgres', '-c', 'wal_level=logical']
+    healthcheck:
+      test: ["CMD", "pg_isready", "-q", "-d", "postgres", "-U", "admin"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "5434:5432"
+    restart: always
+    volumes:
+      - ./data_db_dw_postgres:/var/lib/postgresql/data
+    networks:
+      flex_network:
+        ipv4_address: 172.20.0.7
+
+
+  app_s3_to_postgres: #This represents a lambda that loads data needed for analytics  from datalake (S3) to datawarehouse landing zone
+    container_name: app_s3_to_postgres
+    build:
+      context: ./app_s3_to_postgres
+      dockerfile: dockerfile.s3_to_postgres
+    environment:
+      - POSTGRES_USER=admin
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=postgres   
+      - POSTGRES_HOST=postgres_for_datawarehouse
+      - POSTGRES_PORT=5432
+      - BUCKET_NAME=webapp-bucket
+      - AWS_ACCESS_KEY_ID=yourkey
+      - AWS_SECRET_ACCESS_KEY=yoursecretkey #better to use environment variables
+      - AWS_END_POINT=http://172.20.0.5:9000 
+      - AWS_REGION=us-east-6
+    depends_on:
+      postgres_for_datawarehouse:
+        condition: service_healthy
+      landing_zone_s3:
+        condition: service_started
+    stdin_open: true
+    restart: unless-stopped
+    volumes:
+      - ./app_s3_to_postgres:/app
+    networks:
+      flex_network:
+        ipv4_address: 172.20.0.8
+
+
+  redpanda_server: #This is the Redpanda server as a kafka compatible streaming service. This could be used for realtime data analytics if Flex has a need.
+    container_name: redpanda_server
+
+  redpanda-init: #This is the instance that starts the kafka service and creates a topic. This service will exit upon execution
+
+
+  redpanda_console: #This is the GUI for the Redpanda Kafka. I prefer Redpanda over Apachi Kafka due to the GUI and performance improvements.
+
+  debezium: #Much easier to use Debezium than setting up connectors from the console. 
+    image: debezium/connect:2.4
+
+  debezium_ui: #Debezium UI . Much needed if using Kafka servers.
+    image: quay.io/debezium/debezium-ui
+  
+
+  debezium-init: #This is the EC2 instance creates a connector
+
+  dbt:
+    build: 
+      context: ./dbt
+      dockerfile: dockerfile.dbt_datawarehouse
+    container_name: dbt_datawarehouse
+    volumes:
+      - ./dbt:/dbt
+
+
+  grafana: #For visualization. It is an open source visualization tool with powerful realtime analytics features.
+    image: grafana/grafana-enterprise
+
+# #############DRAFT#####################################
+
+  airflow: #airflow setup is more complicated but managed airflow services from cloud providers are available.
+
